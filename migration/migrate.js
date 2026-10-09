@@ -1,9 +1,11 @@
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import { MongoClient } from "mongodb";
+import { createClient } from "redis";
 
 const source = process.env.SQLITE_PATH || "/data/forme-comtoise.sqlite";
 const mongo = new MongoClient(process.env.MONGO_URI || "mongodb://localhost:27017");
+const redis = createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" });
 const dbName = process.env.MONGO_DB || "forme_comtoise";
 
 const rows = (db, table) => db.all(`SELECT * FROM ${table}`);
@@ -13,6 +15,7 @@ const specialties = value => [...new Set(String(value || "").split(/[;,]/).map(s
 
 const db = await open({ filename: source, driver: sqlite3.Database });
 await mongo.connect();
+await redis.connect();
 const target = mongo.db(dbName);
 await target.dropDatabase();
 
@@ -77,4 +80,6 @@ await Promise.all([
 ]);
 console.log(`Migration terminée: ${clubs.length} clubs, ${members.length} adhérents, ${sessions.length} séances.`);
 await db.close();
+await redis.flushAll();
+await redis.quit();
 await mongo.close();

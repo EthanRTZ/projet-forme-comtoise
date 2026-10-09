@@ -18,11 +18,14 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: forme_comtoise
+      REDIS_URL: redis://redis:6379
     volumes:
       - ./data:/data:ro
     depends_on:
-      - mongo
-    profiles: ["migration"]
+      mongo:
+        condition: service_started
+      redis:
+        condition: service_started
 
   api:
     build: ./api
@@ -37,8 +40,12 @@ services:
     volumes:
       - reports:/reports
     depends_on:
-      - mongo
-      - redis
+      mongo:
+        condition: service_started
+      redis:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
 
   worker:
     build: ./worker
@@ -51,8 +58,12 @@ services:
       - ./data:/data:ro
       - reports:/reports
     depends_on:
-      - mongo
-      - redis
+      mongo:
+        condition: service_started
+      redis:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
 
 volumes:
   mongo-data:

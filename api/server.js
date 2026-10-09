@@ -16,7 +16,7 @@ const Club = mongoose.model("Club", new Schema({ legacyId: Number, code: String,
 const Formula = mongoose.model("Formula", new Schema({ legacyId: Number, code: String, label: String, monthlyPriceCents: Number, commitmentMonths: Number, groupClasses: Boolean, allClubs: Boolean }, { collection: "formules" }));
 const Member = mongoose.model("Member", new Schema({ legacyId: Number, badge: String, firstName: String, lastName: String, email: String, phone: String, birthDate: Date, homeClubLegacyId: Number, registeredAt: Date, subscriptions: [Schema.Types.Mixed] }, { collection: "adherents" }));
 const Coach = mongoose.model("Coach", new Schema({ legacyId: Number, firstName: String, lastName: String, email: String, clubLegacyId: Number, specialties: [String], hiredAt: Date, active: Boolean }, { collection: "coachs" }));
-const Session = mongoose.model("Session", new Schema({ legacyId: Number, activity: Schema.Types.Mixed, coach: Schema.Types.Mixed, clubLegacyId: Number, room: String, startsAt: Date, places: Number, cancelled: Boolean, reservations: [Schema.Types.Mixed] }));
+const Session = mongoose.model("Session", new Schema({ legacyId: Number, activity: Schema.Types.Mixed, coach: Schema.Types.Mixed, clubLegacyId: Number, room: String, startsAt: Date, places: Number, cancelled: Boolean, reservations: [Schema.Types.Mixed] }, { collection: "seances" }));
 const cacheEnabled = () => process.env.CACHE_ENABLED !== "false";
 const cached = async (key, ttl, producer) => {
   if (!cacheEnabled()) return producer();
@@ -79,12 +79,16 @@ app.post("/seances/:sessionId/reservations", asyncRoute(async (req, res) => {
   );
   if (!result.modifiedCount) return res.status(409).json({ error: "Plus de place ou réservation déjà existante" });
   await invalidate(`planning:${session.clubLegacyId}:*`);
+  await invalidate("stats:remplissage:*");
+  await invalidate("stats:coachs");
   res.status(201).json(booking);
 }));
 app.delete("/seances/:sessionId/reservations/:memberId", asyncRoute(async (req, res) => {
   const result = await Session.updateOne({ legacyId: id(req.params.sessionId), "reservations.memberLegacyId": id(req.params.memberId), "reservations.status": "confirmee" }, { $set: { "reservations.$.status": "annulee" } });
   if (!result.modifiedCount) return res.status(404).json({ error: "Réservation introuvable" });
   await invalidate("planning:*");
+  await invalidate("stats:remplissage:*");
+  await invalidate("stats:coachs");
   res.status(204).end();
 }));
 app.get("/adherents/:memberId", asyncRoute(async (req, res) => {
@@ -114,22 +118,40 @@ app.patch("/coachs/:coachId", asyncRoute(async (req, res) => {
   if (req.body.specialties) changes.specialties = req.body.specialties.map(s => s.trim().toLowerCase()).filter(Boolean);
   const coach = await Coach.findOneAndUpdate({ legacyId: id(req.params.coachId) }, changes, { new: true });
   if (!coach) return res.status(404).json({ error: "Coach introuvable" });
+  await invalidate("stats:coachs");
   res.json(coach);
 }));
 app.patch("/seances/:sessionId/annulation", asyncRoute(async (req, res) => {
   const session = await Session.findOneAndUpdate({ legacyId: id(req.params.sessionId) }, { $set: { cancelled: true } }, { new: true });
   if (!session) return res.status(404).json({ error: "Séance introuvable" });
   await invalidate("planning:*");
+  await invalidate("stats:*");
   res.json(session);
 }));
 
 app.get("/statistiques/remplissage", asyncRoute(async (req, res) => {
   const match = { cancelled: false, startsAt: { $gte: new Date(req.query.debut), $lte: new Date(req.query.fin) } };
-  const result = await Session.aggregate([{ $match: match }, { $unwind: { path: "$reservations", preserveNullAndEmptyArrays: true } }, { $group: { _id: "$activity.name", places: { $sum: "$places" }, booked: { $sum: { $cond: [{ $in: ["$reservations.status", ["confirmee", "presente", "absente"]] }, 1, 0] } }, absent: { $sum: { $cond: [{ $eq: ["$reservations.status", "absente"] }, 1, 0] } } } }, { $project: { _id: 0, activite: "$_id", tauxRemplissage: { $cond: [{ $eq: ["$places", 0] }, 0, { $multiply: [{ $divide: ["$booked", "$places"] }, 100] }] }, tauxAbsence: { $cond: [{ $eq: ["$booked", 0] }, 0, { $multiply: [{ $divide: ["$absent", "$booked"] }, 100] }] } } }]);
+  const key = `stats:remplissage:${req.query.debut}:${req.query.fin}`;
+  const result = await cached(key, 180, () => Session.aggregate([
+    { $match: match },
+    { $project: {
+      activityName: "$activity.name",
+      places: 1,
+      booked: { $size: { $filter: { input: "$reservations", as: "r", cond: { $in: ["$$r.status", ["confirmee", "presente", "absente"]] } } } },
+      absent: { $size: { $filter: { input: "$reservations", as: "r", cond: { $eq: ["$$r.status", "absente"] } } } }
+    } },
+    { $group: { _id: "$activityName", places: { $sum: "$places" }, booked: { $sum: "$booked" }, absent: { $sum: "$absent" } } },
+    { $project: {
+      _id: 0,
+      activite: "$_id",
+      tauxRemplissage: { $cond: [{ $eq: ["$places", 0] }, 0, { $multiply: [{ $divide: ["$booked", "$places"] }, 100] }] },
+      tauxAbsence: { $cond: [{ $eq: ["$booked", 0] }, 0, { $multiply: [{ $divide: ["$absent", "$booked"] }, 100] }] }
+    } }
+  ]));
   res.json(result);
 }));
 app.get("/statistiques/coachs", asyncRoute(async (req, res) => {
-  const result = await Session.aggregate([
+  const result = await cached("stats:coachs", 180, () => Session.aggregate([
     { $match: { cancelled: false } },
     { $lookup: { from: "coachs", localField: "coach.legacyId", foreignField: "legacyId", as: "coachRecord" } },
     { $group: {
@@ -141,13 +163,16 @@ app.get("/statistiques/coachs", asyncRoute(async (req, res) => {
     } },
     { $sort: { reservations: -1 } },
     { $project: { _id: 0, coach: 1, coachRecord: 1, cours: 1, reservations: 1 } }
-  ]);
+  ]));
   res.json(result);
 }));
 app.get("/statistiques/chiffre-affaires", asyncRoute(async (req, res) => {
   const clubId = id(req.query.clubId), month = new Date(`${req.query.mois || new Date().toISOString().slice(0, 7)}-01`);
-  const members = await Member.find({ homeClubLegacyId: clubId }).lean();
-  const total = members.flatMap(m => m.subscriptions || []).filter(s => new Date(s.start) <= month && (!s.end || new Date(s.end) >= month) && ["actif", "suspendu"].includes(s.status)).reduce((sum, s) => sum + s.priceCents, 0);
+  const key = `stats:ca:${clubId}:${month.toISOString().slice(0, 7)}`;
+  const total = await cached(key, 300, async () => {
+    const members = await Member.find({ homeClubLegacyId: clubId }).lean();
+    return members.flatMap(m => m.subscriptions || []).filter(s => new Date(s.start) <= month && (!s.end || new Date(s.end) >= month) && ["actif", "suspendu"].includes(s.status)).reduce((sum, s) => sum + s.priceCents, 0);
+  });
   res.json({ clubId, month, amountCents: total });
 }));
 app.post("/rapports", asyncRoute(async (req, res) => {
